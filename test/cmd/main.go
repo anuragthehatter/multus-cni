@@ -11,6 +11,9 @@ import (
 	e "github.com/openshift-eng/openshift-tests-extension/pkg/extension"
 	et "github.com/openshift-eng/openshift-tests-extension/pkg/extension/extensiontests"
 	g "github.com/openshift-eng/openshift-tests-extension/pkg/ginkgo"
+
+	// Import OTP test package
+	_ "gopkg.in/k8snetworkplumbingwg/multus-cni.v4/test/otp"
 )
 
 func main() {
