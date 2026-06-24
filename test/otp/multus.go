@@ -3,6 +3,7 @@ package otp
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -52,7 +53,7 @@ var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus [Suite:opensh
 	})
 
 	// High-57589: Whereabouts CNI Timeout with Large Exclude Range
-	g.It("[OTP][informing][57589] should handle large IPv6 exclude ranges without timeout", func() {
+	g.It("57589-should handle large IPv6 exclude ranges without timeout", func() {
 		const testNS = "test-whereabouts-57589"
 
 		g.By("Creating test namespace")
@@ -145,7 +146,7 @@ var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus [Suite:opensh
 	})
 
 	// Medium-76652: Dummy CNI Support
-	g.It("[OTP][informing][76652] should support Dummy CNI plugin with Multus", func() {
+	g.It("76652-should support Dummy CNI plugin with Multus", func() {
 		const testNS = "test-dummy-cni-76652"
 
 		g.By("Creating test namespace")
@@ -241,7 +242,7 @@ var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus [Suite:opensh
 	})
 
 	// Medium-66876: Support Dual Stack IP assignment for whereabouts CNI/IPAM
-	g.It("[OTP][informing][66876] should assign dual-stack IPs with Whereabouts IPAM", func() {
+	g.It("66876-should assign dual-stack IPs with Whereabouts IPAM", func() {
 		const testNS = "test-whereabouts-dualstack-66876"
 
 		g.By("Creating test namespace")
@@ -516,7 +517,7 @@ python3 /tmp/server.py`,
 
 	// OCP-69947: Macvlan pods send Unsolicited Neighbor Advertisements
 	// Note: Marked as informing due to timing sensitivity with tcpdump in automated environment
-	g.It("[OTP][informing][69947] should send Unsolicited Neighbor Advertisements when macvlan pod is created", func() {
+	g.It("69947-should send Unsolicited Neighbor Advertisements when macvlan pod is created", func() {
 		testNS := "test-macvlan-na-69947"
 
 		g.By("Creating test namespace")
@@ -844,14 +845,29 @@ python3 /tmp/server.py`,
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		g.By("Creating ReplicationController with 2 pods on the same node")
-		// First, get a schedulable node
-		nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-			LabelSelector: "node-role.kubernetes.io/worker",
-		})
+		// Get a schedulable node (works on SNO, standard HA, and HyperShift)
+		nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(len(nodes.Items)).To(o.BeNumerically(">", 0), "Should have at least one worker node")
+		o.Expect(len(nodes.Items)).To(o.BeNumerically(">", 0), "Should have at least one node")
 
-		targetNode := nodes.Items[0].Name
+		// Find first Ready, schedulable node (no taints blocking scheduling)
+		var targetNode string
+		for _, node := range nodes.Items {
+			// Check if node is Ready
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+					// Check if node is schedulable (not cordoned)
+					if !node.Spec.Unschedulable {
+						targetNode = node.Name
+						break
+					}
+				}
+			}
+			if targetNode != "" {
+				break
+			}
+		}
+		o.Expect(targetNode).NotTo(o.BeEmpty(), "Should have at least one Ready, schedulable node")
 
 		rc := &corev1.ReplicationController{
 			ObjectMeta: metav1.ObjectMeta{
@@ -961,7 +977,7 @@ python3 /tmp/server.py`,
 		err = corev1.AddToScheme(scheme)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		pingCmd := []string{"/bin/sh", "-c", fmt.Sprintf("ping -c 3 -W 2 %s", pod2SecondaryIP)}
+		pingCmd := []string{"ping", "-c", "3", "-W", "2", pod2SecondaryIP}
 		req := clientset.CoreV1().RESTClient().Post().
 			Resource("pods").
 			Name(pod1.Name).
@@ -1072,13 +1088,27 @@ python3 /tmp/server.py`,
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		g.By("Creating ReplicationController with 2 pods using both NADs on the same node")
-		nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{
-			LabelSelector: "node-role.kubernetes.io/worker",
-		})
+		// Get a schedulable node (works on SNO, standard HA, and HyperShift)
+		nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(len(nodes.Items)).To(o.BeNumerically(">", 0), "Should have at least one worker node")
+		o.Expect(len(nodes.Items)).To(o.BeNumerically(">", 0), "Should have at least one node")
 
-		targetNode := nodes.Items[0].Name
+		// Find first Ready, schedulable node
+		var targetNode string
+		for _, node := range nodes.Items {
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+					if !node.Spec.Unschedulable {
+						targetNode = node.Name
+						break
+					}
+				}
+			}
+			if targetNode != "" {
+				break
+			}
+		}
+		o.Expect(targetNode).NotTo(o.BeEmpty(), "Should have at least one Ready, schedulable node")
 
 		rc := &corev1.ReplicationController{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1202,7 +1232,7 @@ python3 /tmp/server.py`,
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		g.By("Verifying pods CANNOT communicate via isolated network")
-		pingIsolatedCmd := []string{"/bin/sh", "-c", fmt.Sprintf("ping -c 3 -W 2 %s", pod2IsolatedIP)}
+		pingIsolatedCmd := []string{"ping", "-c", "3", "-W", "2", pod2IsolatedIP}
 		req := clientset.CoreV1().RESTClient().Post().
 			Resource("pods").
 			Name(pod1.Name).
@@ -1233,7 +1263,7 @@ python3 /tmp/server.py`,
 		), "Should show network isolation on isolated network")
 
 		g.By("Verifying pods CAN communicate via non-isolated network")
-		pingNonIsolatedCmd := []string{"/bin/sh", "-c", fmt.Sprintf("ping -c 3 -W 2 %s", pod2NonIsolatedIP)}
+		pingNonIsolatedCmd := []string{"ping", "-c", "3", "-W", "2", pod2NonIsolatedIP}
 		req = clientset.CoreV1().RESTClient().Post().
 			Resource("pods").
 			Name(pod1.Name).
