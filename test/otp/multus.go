@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -24,7 +26,7 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
-var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus", func() {
+var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus [Suite:openshift/multus-cni]", func() {
 	var (
 		clientset *kubernetes.Clientset
 		config    *rest.Config
@@ -32,7 +34,9 @@ var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus", func() {
 	)
 
 	g.BeforeEach(func() {
-		ctx = context.Background()
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Minute)
+		g.DeferCleanup(cancel)
 
 		// Load kubeconfig
 		loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
@@ -67,7 +71,9 @@ var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus", func() {
 
 		defer func() {
 			g.By("Cleaning up test namespace")
-			_ = clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{})
+			if err := clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				g.GinkgoLogr.Error(err, "Failed to delete test namespace", "namespace", testNS)
+			}
 		}()
 
 		g.By("Creating NetworkAttachmentDefinition with large exclude range")
@@ -158,7 +164,9 @@ var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus", func() {
 
 		defer func() {
 			g.By("Cleaning up test namespace")
-			_ = clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{})
+			if err := clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				g.GinkgoLogr.Error(err, "Failed to delete test namespace", "namespace", testNS)
+			}
 		}()
 
 		g.By("Creating NetworkAttachmentDefinition with dummy CNI and static IPAM")
@@ -252,7 +260,9 @@ var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus", func() {
 
 		defer func() {
 			g.By("Cleaning up test namespace")
-			_ = clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{})
+			if err := clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				g.GinkgoLogr.Error(err, "Failed to delete test namespace", "namespace", testNS)
+			}
 		}()
 
 		g.By("Creating NetworkAttachmentDefinition with dual-stack Whereabouts IPAM")
@@ -316,8 +326,8 @@ var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus", func() {
 						},
 						Containers: []corev1.Container{
 							{
-								Name:  "test-pod",
-								Image: "registry.access.redhat.com/ubi9/python-39:latest",
+								Name:    "test-pod",
+								Image:   "registry.access.redhat.com/ubi9/python-39:latest",
 								Command: []string{"/bin/bash", "-c"},
 								Args: []string{
 									`cat > /tmp/server.py <<'PYEOF'
@@ -524,7 +534,9 @@ python3 /tmp/server.py`,
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		defer func() {
-			_ = clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{})
+			if err := clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				g.GinkgoLogr.Error(err, "Failed to delete test namespace", "namespace", testNS)
+			}
 		}()
 
 		g.By("Creating NetworkAttachmentDefinition with dual-stack whereabouts IPAM")
@@ -554,6 +566,9 @@ python3 /tmp/server.py`,
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "sniff-pod",
 				Namespace: testNS,
+				Labels: map[string]string{
+					"app": "sniffer",
+				},
 				Annotations: map[string]string{
 					"k8s.v1.cni.cncf.io/networks": "whereabouts-dualstack",
 				},
@@ -561,8 +576,8 @@ python3 /tmp/server.py`,
 			Spec: corev1.PodSpec{
 				Containers: []corev1.Container{
 					{
-						Name:  "sniffer",
-						Image: "quay.io/openshifttest/hello-sdn@sha256:c89445416459e7adea9a5a416b3365ed3d74f2491beb904d61dc8d1eb89a72a4",
+						Name:    "sniffer",
+						Image:   "quay.io/openshifttest/hello-sdn@sha256:c89445416459e7adea9a5a416b3365ed3d74f2491beb904d61dc8d1eb89a72a4",
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							// Start tcpdump to capture ICMPv6 Neighbor Advertisements on net1
@@ -617,6 +632,20 @@ python3 /tmp/server.py`,
 						},
 					},
 					Spec: corev1.PodSpec{
+						Affinity: &corev1.Affinity{
+							PodAffinity: &corev1.PodAffinity{
+								RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+									{
+										LabelSelector: &metav1.LabelSelector{
+											MatchLabels: map[string]string{
+												"app": "sniffer",
+											},
+										},
+										TopologyKey: "kubernetes.io/hostname",
+									},
+								},
+							},
+						},
 						Containers: []corev1.Container{
 							{
 								Name:  "test-pod",
@@ -681,10 +710,12 @@ python3 /tmp/server.py`,
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		var stdout, stderr bytes.Buffer
-		_ = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		if err := exec.StreamWithContext(ctx, remotecommand.StreamOptions{
 			Stdout: &stdout,
 			Stderr: &stderr,
-		})
+		}); err != nil {
+			g.GinkgoLogr.Error(err, "Failed to kill tcpdump process", "stdout", stdout.String(), "stderr", stderr.String())
+		}
 
 		// Wait for tcpdump to flush pcap file to disk
 		time.Sleep(5 * time.Second)
@@ -717,8 +748,10 @@ python3 /tmp/server.py`,
 		})
 		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to analyze pcap: %s", stderr.String())
 
-		naCount := strings.TrimSpace(stdout.String())
-		o.Expect(naCount).NotTo(o.Equal("0"), "Should have captured at least one ICMPv6 Neighbor Advertisement")
+		naCountStr := strings.TrimSpace(stdout.String())
+		naCount, err := strconv.Atoi(naCountStr)
+		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to parse NA count: %s", naCountStr)
+		o.Expect(naCount).To(o.BeNumerically(">", 0), "Should have captured at least one ICMPv6 Neighbor Advertisement")
 
 		g.By("Verifying Neighbor Advertisements are Unsolicited (solicited flag = 0)")
 		// Check that captured NAs have solicited flag = 0
@@ -749,8 +782,10 @@ python3 /tmp/server.py`,
 		})
 		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to verify unsolicited NAs: %s", stderr.String())
 
-		unsolicitedCount := strings.TrimSpace(stdout.String())
-		o.Expect(unsolicitedCount).NotTo(o.Equal("0"),
+		unsolicitedCountStr := strings.TrimSpace(stdout.String())
+		unsolicitedCount, err := strconv.Atoi(unsolicitedCountStr)
+		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to parse unsolicited NA count: %s", unsolicitedCountStr)
+		o.Expect(unsolicitedCount).To(o.BeNumerically(">", 0),
 			"Should have captured Unsolicited Neighbor Advertisements (destination ff02::1)")
 	})
 
@@ -773,7 +808,9 @@ python3 /tmp/server.py`,
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		defer func() {
-			_ = clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{})
+			if err := clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				g.GinkgoLogr.Error(err, "Failed to delete test namespace", "namespace", testNS)
+			}
 		}()
 
 		g.By("Creating NetworkAttachmentDefinition with portIsolation enabled")
@@ -973,7 +1010,9 @@ python3 /tmp/server.py`,
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		defer func() {
-			_ = clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{})
+			if err := clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				g.GinkgoLogr.Error(err, "Failed to delete test namespace", "namespace", testNS)
+			}
 		}()
 
 		g.By("Creating NAD with portIsolation enabled")
