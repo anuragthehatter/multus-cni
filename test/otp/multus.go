@@ -27,7 +27,7 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
-var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus [Suite:openshift/multus-cni]", func() {
+var _ = g.Describe("[sig-network][OTP][Suite:openshift/conformance/parallel] Multus CNI", func() {
 	var (
 		clientset *kubernetes.Clientset
 		config    *rest.Config
@@ -53,7 +53,7 @@ var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus [Suite:opensh
 	})
 
 	// High-57589: Whereabouts CNI Timeout with Large Exclude Range
-	g.It("57589-should handle large IPv6 exclude ranges without timeout", func() {
+	g.It("[JIRA:Networking][OTP] 57589-should handle large IPv6 exclude ranges without timeout", func() {
 		const testNS = "test-whereabouts-57589"
 
 		g.By("Creating test namespace")
@@ -146,7 +146,7 @@ var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus [Suite:opensh
 	})
 
 	// Medium-76652: Dummy CNI Support
-	g.It("76652-should support Dummy CNI plugin with Multus", func() {
+	g.It("[JIRA:Networking][OTP] 76652-should support Dummy CNI plugin with Multus", func() {
 		const testNS = "test-dummy-cni-76652"
 
 		g.By("Creating test namespace")
@@ -242,7 +242,7 @@ var _ = g.Describe("[JIRA:Networking][OTP][sig-network] OTP Multus [Suite:opensh
 	})
 
 	// Medium-66876: Support Dual Stack IP assignment for whereabouts CNI/IPAM
-	g.It("66876-should assign dual-stack IPs with Whereabouts IPAM", func() {
+	g.It("[JIRA:Networking][OTP] 66876-should assign dual-stack IPs with Whereabouts IPAM", func() {
 		const testNS = "test-whereabouts-dualstack-66876"
 
 		g.By("Creating test namespace")
@@ -517,7 +517,22 @@ python3 /tmp/server.py`,
 
 	// OCP-69947: Macvlan pods send Unsolicited Neighbor Advertisements
 	// Note: Marked as informing due to timing sensitivity with tcpdump in automated environment
-	g.It("69947-should send Unsolicited Neighbor Advertisements when macvlan pod is created", func() {
+	g.It("[JIRA:Networking][OTP] 69947-should send Unsolicited Neighbor Advertisements when macvlan pod is created", func() {
+		// AWS Limitation: AWS VPC doesn't support L2 IPv6 multicast/NDP required for macvlan NAs.
+		// This test validates ICMPv6 Neighbor Advertisement packets sent when macvlan pods are created,
+		// which requires L2 network capabilities that AWS VPC blocks at the hypervisor level.
+		// Test will SKIP on AWS and should PASS on bare metal, VMware, or other L2-capable platforms.
+		// To verify this test actually works (not just skips), run on non-AWS infrastructure where
+		// L2 multicast is supported. Check OTP CI results on bare metal clusters for validation.
+		nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{Limit: 1})
+		o.Expect(err).NotTo(o.HaveOccurred())
+		if len(nodes.Items) > 0 {
+			providerID := nodes.Items[0].Spec.ProviderID
+			if providerID != "" && (strings.Contains(providerID, "aws") || strings.Contains(providerID, "ec2")) {
+				g.Skip("Skipping on AWS: AWS VPC doesn't support L2 IPv6 multicast/NDP required for macvlan Unsolicited Neighbor Advertisements")
+			}
+		}
+
 		testNS := "test-macvlan-na-69947"
 
 		g.By("Creating test namespace")
@@ -531,7 +546,7 @@ python3 /tmp/server.py`,
 				},
 			},
 		}
-		_, err := clientset.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
+		_, err = clientset.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		defer func() {
@@ -791,7 +806,7 @@ python3 /tmp/server.py`,
 	})
 
 	// OCP-80524: Verify pods with isolated port using bridge-cni
-	g.It("80524-should isolate pods with portIsolation enabled on bridge CNI", func() {
+	g.It("[JIRA:Networking][OTP] 80524-should isolate pods with portIsolation enabled on bridge CNI", func() {
 		testNS := "test-bridge-port-isolation-80524"
 
 		g.By("Creating test namespace")
@@ -1008,7 +1023,7 @@ python3 /tmp/server.py`,
 		), "Should show network isolation")
 	})
 
-	g.It("80525-should allow communication on non-isolated network but not on isolated network", func() {
+	g.It("[JIRA:Networking][OTP] 80525-should allow communication on non-isolated network but not on isolated network", func() {
 		testNS := "test-bridge-mixed-isolation-80525"
 
 		g.By("Creating test namespace")
@@ -1292,6 +1307,154 @@ python3 /tmp/server.py`,
 		o.Expect(nonIsolatedOutput).To(o.ContainSubstring("0% packet loss"), "Should show successful ping on non-isolated network")
 	})
 
+	g.It("[JIRA:Networking][OTP] 77102-should have secure permissions on CNI configuration files", func() {
+		testNS := "test-cni-permissions-77102"
+
+		g.By("Creating test namespace")
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: testNS,
+				Labels: map[string]string{
+					"pod-security.kubernetes.io/enforce": "privileged",
+					"pod-security.kubernetes.io/audit":   "privileged",
+					"pod-security.kubernetes.io/warn":    "privileged",
+				},
+			},
+		}
+		_, err := clientset.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		defer func() {
+			g.By("Cleaning up test namespace")
+			if err := clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				g.GinkgoLogr.Error(err, "Failed to delete test namespace", "namespace", testNS)
+			}
+		}()
+
+		g.By("Checking multus config permissions via multus pods")
+		multusPods, err := clientset.CoreV1().Pods("openshift-multus").List(ctx, metav1.ListOptions{
+			LabelSelector: "app=multus",
+		})
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(len(multusPods.Items)).To(o.BeNumerically(">", 0), "Expected at least one multus pod")
+
+		// Check first multus pod for config file permissions
+		multusPod := multusPods.Items[0].Name
+		output, err := execInPod(ctx, clientset, config, "openshift-multus", multusPod, "kube-multus",
+			[]string{"/bin/bash", "-c", "stat -c '%a %n' /host/etc/cni/net.d/*.conf"})
+		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to check multus config permissions")
+
+		g.By("Verifying multus config has 600 permissions")
+		lines := strings.Split(strings.TrimSpace(output), "\n")
+		for _, line := range lines {
+			if line == "" {
+				continue
+			}
+			parts := strings.Fields(line)
+			o.Expect(len(parts)).To(o.BeNumerically(">=", 2), "Invalid stat output: %s", line)
+			perms := parts[0]
+			filename := parts[1]
+			o.Expect(perms).To(o.Equal("600"),
+				"CIS violation: %s has insecure permissions %s (expected 600)", filename, perms)
+		}
+
+		g.By("Checking whereabouts config permissions")
+		// Get a schedulable node (SNO compatible)
+		nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(len(nodes.Items)).To(o.BeNumerically(">", 0), "Should have at least one node")
+
+		// Find first Ready, schedulable node
+		var nodeName string
+		for _, node := range nodes.Items {
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+					if !node.Spec.Unschedulable {
+						nodeName = node.Name
+						break
+					}
+				}
+			}
+			if nodeName != "" {
+				break
+			}
+		}
+		o.Expect(nodeName).NotTo(o.BeEmpty(), "Should have at least one Ready, schedulable node")
+
+		// Create debug pod on node
+		debugPodName := "cis-perms-check-77102"
+		debugPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      debugPodName,
+				Namespace: testNS,
+			},
+			Spec: corev1.PodSpec{
+				NodeName:    nodeName,
+				HostNetwork: true,
+				HostPID:     true,
+				Containers: []corev1.Container{
+					{
+						Name:    "debug",
+						Image:   "registry.access.redhat.com/ubi8/ubi-minimal:latest",
+						Command: []string{"sleep", "300"},
+						SecurityContext: &corev1.SecurityContext{
+							Privileged: boolPtr(true),
+						},
+						VolumeMounts: []corev1.VolumeMount{
+							{
+								Name:      "host",
+								MountPath: "/host",
+							},
+						},
+					},
+				},
+				Volumes: []corev1.Volume{
+					{
+						Name: "host",
+						VolumeSource: corev1.VolumeSource{
+							HostPath: &corev1.HostPathVolumeSource{
+								Path: "/",
+							},
+						},
+					},
+				},
+				RestartPolicy: corev1.RestartPolicyNever,
+			},
+		}
+
+		_, err = clientset.CoreV1().Pods(testNS).Create(ctx, debugPod, metav1.CreateOptions{})
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		// Wait for debug pod to be running
+		o.Eventually(func() corev1.PodPhase {
+			p, err := clientset.CoreV1().Pods(testNS).Get(ctx, debugPodName, metav1.GetOptions{})
+			if err != nil {
+				return corev1.PodPending
+			}
+			return p.Status.Phase
+		}, 60, 5).Should(o.Equal(corev1.PodRunning), "Debug pod did not reach Running state")
+
+		// Check whereabouts config file permissions
+		output, err = execInPod(ctx, clientset, config, testNS, debugPodName, "debug",
+			[]string{"/bin/bash", "-c", "stat -c '%a %n' /host/etc/kubernetes/cni/net.d/whereabouts.d/*.conf /host/etc/kubernetes/cni/net.d/whereabouts.d/*.kubeconfig 2>/dev/null || true"})
+		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to check whereabouts config permissions")
+
+		g.By("Verifying whereabouts configs have 600 permissions")
+		if strings.TrimSpace(output) != "" {
+			lines = strings.Split(strings.TrimSpace(output), "\n")
+			for _, line := range lines {
+				if line == "" {
+					continue
+				}
+				parts := strings.Fields(line)
+				o.Expect(len(parts)).To(o.BeNumerically(">=", 2), "Invalid stat output: %s", line)
+				perms := parts[0]
+				filename := parts[1]
+				o.Expect(perms).To(o.Equal("600"),
+					"CIS violation: %s has insecure permissions %s (expected 600)", filename, perms)
+			}
+		}
+	})
 })
 
 // createNAD creates a NetworkAttachmentDefinition
@@ -1325,7 +1488,52 @@ func createNAD(ctx context.Context, config *rest.Config, namespace, name, nadCon
 	return err
 }
 
+// Helper functions
+
 // int32Ptr returns a pointer to an int32
 func int32Ptr(i int32) *int32 {
 	return &i
+}
+
+// boolPtr returns a pointer to a bool
+func boolPtr(b bool) *bool {
+	return &b
+}
+
+// execInPod executes a command in a pod and returns the output
+func execInPod(ctx context.Context, clientset *kubernetes.Clientset, config *rest.Config,
+	namespace, podName, containerName string, command []string) (string, error) {
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		return "", err
+	}
+
+	req := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: containerName,
+			Command:   command,
+			Stdout:    true,
+			Stderr:    true,
+		}, runtime.NewParameterCodec(scheme))
+
+	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if err != nil {
+		return "", err
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		return stdout.String() + "\n" + stderr.String(), err
+	}
+
+	return stdout.String(), nil
 }
