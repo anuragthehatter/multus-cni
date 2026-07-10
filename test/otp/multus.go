@@ -1456,6 +1456,330 @@ python3 /tmp/server.py`,
 			}
 		}
 	})
+
+	g.It("[JIRA:Networking][OTP][Serial][Disruptive] 74933-should reconcile whereabouts IPs after forced node reboot", func() {
+		// NOTE: This is a disruptive test that force reboots a node
+		// It runs in serial CI jobs (e.g., e2e-aws-ovn-serial) designed for such tests
+		// Related: OCPBUGS-35923, OCPBUGS-16008
+		testNS := "test-whereabouts-reconcile-74933"
+		nadName := "whereabouts-reconcile"
+		statefulSetName := "test-sts"
+		replicas := int32(2)
+
+		g.By("Creating test namespace")
+		ns := &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: testNS,
+			},
+		}
+		_, err := clientset.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		defer func() {
+			g.By("Cleaning up test namespace")
+			if err := clientset.CoreV1().Namespaces().Delete(ctx, testNS, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				g.GinkgoLogr.Error(err, "Failed to delete test namespace", "namespace", testNS)
+			}
+		}()
+
+		// Get schedulable nodes
+		g.By("Finding schedulable nodes")
+		nodes, err := clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(len(nodes.Items)).To(o.BeNumerically(">", 0), "Should have at least one node")
+
+		var targetNode string
+		for _, node := range nodes.Items {
+			// Find a Ready, schedulable node
+			isReady := false
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+					isReady = true
+					break
+				}
+			}
+			if isReady && !node.Spec.Unschedulable {
+				targetNode = node.Name
+				break
+			}
+		}
+		o.Expect(targetNode).NotTo(o.BeEmpty(), "Should have at least one Ready, schedulable node")
+
+		g.By(fmt.Sprintf("Updating whereabouts reconciler configuration on node %s", targetNode))
+		// Create debug pod on target node to modify whereabouts config
+		debugPodName := "whereabouts-config-update"
+		debugPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      debugPodName,
+				Namespace: testNS,
+			},
+			Spec: corev1.PodSpec{
+				NodeName:    targetNode,
+				HostNetwork: true,
+				HostPID:     true,
+				Containers: []corev1.Container{
+					{
+						Name:    "debug",
+						Image:   "registry.access.redhat.com/ubi8/ubi-minimal:latest",
+						Command: []string{"sleep", "600"},
+						SecurityContext: &corev1.SecurityContext{
+							Privileged: boolPtr(true),
+						},
+						VolumeMounts: []corev1.VolumeMount{
+							{
+								Name:      "host",
+								MountPath: "/host",
+							},
+						},
+					},
+				},
+				Volumes: []corev1.Volume{
+					{
+						Name: "host",
+						VolumeSource: corev1.VolumeSource{
+							HostPath: &corev1.HostPathVolumeSource{
+								Path: "/",
+							},
+						},
+					},
+				},
+				RestartPolicy: corev1.RestartPolicyNever,
+			},
+		}
+
+		_, err = clientset.CoreV1().Pods(testNS).Create(ctx, debugPod, metav1.CreateOptions{})
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		// Wait for debug pod to be running
+		o.Eventually(func() corev1.PodPhase {
+			p, err := clientset.CoreV1().Pods(testNS).Get(ctx, debugPodName, metav1.GetOptions{})
+			if err != nil {
+				return corev1.PodPending
+			}
+			return p.Status.Phase
+		}, 60, 5).Should(o.Equal(corev1.PodRunning), "Debug pod did not reach Running state")
+
+		// Update whereabouts reconciler configuration
+		updateCmd := []string{
+			"/bin/bash", "-c",
+			`
+			# Backup original config
+			cp /host/etc/kubernetes/cni/net.d/whereabouts.d/whereabouts.conf /host/etc/kubernetes/cni/net.d/whereabouts.d/whereabouts.conf.backup 2>/dev/null || true
+
+			# Update reconciler_cron_expression
+			if [ -f /host/etc/kubernetes/cni/net.d/whereabouts.d/whereabouts.conf ]; then
+				sed -i 's/"reconciler_cron_expression".*/"reconciler_cron_expression": "*\/1 * * * *",/' /host/etc/kubernetes/cni/net.d/whereabouts.d/whereabouts.conf
+				echo "Updated whereabouts reconciler config"
+			else
+				echo "whereabouts.conf not found"
+				exit 1
+			fi
+			`,
+		}
+
+		output, err := execInPod(ctx, clientset, config, testNS, debugPodName, "debug", updateCmd)
+		o.Expect(err).NotTo(o.HaveOccurred(), "Failed to update whereabouts config: %s", output)
+		o.Expect(output).To(o.ContainSubstring("Updated whereabouts reconciler config"))
+
+		g.By("Creating NetworkAttachmentDefinition with whereabouts IPAM")
+		// IP range sized for exactly the number of replicas (tight range for reconciliation test)
+		nadConfig := fmt.Sprintf(`{
+			"cniVersion": "0.3.1",
+			"name": "%s",
+			"type": "bridge",
+			"bridge": "wb-test-br",
+			"ipam": {
+				"type": "whereabouts",
+				"range": "192.168.50.0/30",
+				"reconciler_cron_expression": "*/1 * * * *"
+			}
+		}`, nadName)
+
+		err = createNAD(ctx, config, testNS, nadName, nadConfig)
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By("Creating StatefulSet with pods using whereabouts")
+		statefulSet := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      statefulSetName,
+				Namespace: testNS,
+			},
+			Spec: appsv1.StatefulSetSpec{
+				Replicas: int32Ptr(replicas),
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						"app": statefulSetName,
+					},
+				},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{
+						Labels: map[string]string{
+							"app": statefulSetName,
+						},
+						Annotations: map[string]string{
+							"k8s.v1.cni.cncf.io/networks": nadName,
+						},
+					},
+					Spec: corev1.PodSpec{
+						NodeName: targetNode, // Pin to same node
+						Containers: []corev1.Container{
+							{
+								Name:    "test",
+								Image:   "registry.access.redhat.com/ubi8/ubi-minimal:latest",
+								Command: []string{"sleep", "3600"},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		_, err = clientset.AppsV1().StatefulSets(testNS).Create(ctx, statefulSet, metav1.CreateOptions{})
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		g.By("Waiting for StatefulSet pods to be Running")
+		o.Eventually(func() bool {
+			sts, err := clientset.AppsV1().StatefulSets(testNS).Get(ctx, statefulSetName, metav1.GetOptions{})
+			if err != nil {
+				return false
+			}
+			return sts.Status.ReadyReplicas == replicas
+		}, 120, 5).Should(o.BeTrue(), "StatefulSet pods did not reach Running state")
+
+		g.By("Recording IP addresses from whereabouts before node reboot")
+		podIPs := make(map[string]string)
+		for i := int32(0); i < replicas; i++ {
+			podName := fmt.Sprintf("%s-%d", statefulSetName, i)
+			pod, err := clientset.CoreV1().Pods(testNS).Get(ctx, podName, metav1.GetOptions{})
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			// Parse network status annotation
+			netStatus := pod.Annotations["k8s.v1.cni.cncf.io/network-status"]
+			o.Expect(netStatus).NotTo(o.BeEmpty(), "Pod %s has no network-status annotation", podName)
+
+			var networks []map[string]interface{}
+			err = json.Unmarshal([]byte(netStatus), &networks)
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			// Find the whereabouts network IP
+			// Network name in status can be "nadName" or "namespace/nadName"
+			var secondaryIP string
+			for _, network := range networks {
+				if name, ok := network["name"].(string); ok {
+					if name == nadName || name == fmt.Sprintf("%s/%s", testNS, nadName) {
+						if ips, ok := network["ips"].([]interface{}); ok && len(ips) > 0 {
+							secondaryIP = ips[0].(string)
+							break
+						}
+					}
+				}
+			}
+			o.Expect(secondaryIP).NotTo(o.BeEmpty(), "Pod %s has no secondary IP from whereabouts", podName)
+			podIPs[podName] = secondaryIP
+			g.By(fmt.Sprintf("Pod %s has secondary IP: %s", podName, secondaryIP))
+		}
+
+		g.By(fmt.Sprintf("Force rebooting node %s", targetNode))
+		// Note: This is a destructive operation
+		// In a real test environment, this should be done carefully
+		rebootCmd := []string{
+			"/bin/bash", "-c",
+			"nsenter -t 1 -m -u -i -n reboot --force &",
+		}
+
+		_, _ = execInPod(ctx, clientset, config, testNS, debugPodName, "debug", rebootCmd)
+		// Ignore errors as the pod will be killed during reboot
+
+		g.By("Waiting for node to become NotReady")
+		o.Eventually(func() bool {
+			node, err := clientset.CoreV1().Nodes().Get(ctx, targetNode, metav1.GetOptions{})
+			if err != nil {
+				return false
+			}
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady && condition.Status != corev1.ConditionTrue {
+					return true
+				}
+			}
+			return false
+		}, 120, 5).Should(o.BeTrue(), "Node did not become NotReady after reboot command")
+
+		g.By("Waiting for node to come back and become Ready")
+		o.Eventually(func() bool {
+			node, err := clientset.CoreV1().Nodes().Get(ctx, targetNode, metav1.GetOptions{})
+			if err != nil {
+				return false
+			}
+			for _, condition := range node.Status.Conditions {
+				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+					return true
+				}
+			}
+			return false
+		}, 600, 10).Should(o.BeTrue(), "Node did not come back Ready after reboot")
+
+		g.By("Deleting StatefulSet pods to trigger recreation")
+		for i := int32(0); i < replicas; i++ {
+			podName := fmt.Sprintf("%s-%d", statefulSetName, i)
+			err := clientset.CoreV1().Pods(testNS).Delete(ctx, podName, metav1.DeleteOptions{})
+			if err != nil && !apierrors.IsNotFound(err) {
+				g.GinkgoLogr.Error(err, "Failed to delete pod", "pod", podName)
+			}
+		}
+
+		g.By("Waiting for StatefulSet pods to be recreated and Running")
+		o.Eventually(func() bool {
+			sts, err := clientset.AppsV1().StatefulSets(testNS).Get(ctx, statefulSetName, metav1.GetOptions{})
+			if err != nil {
+				return false
+			}
+			return sts.Status.ReadyReplicas == replicas
+		}, 180, 5).Should(o.BeTrue(), "StatefulSet pods did not get recreated")
+
+		g.By("Verifying pods get the same IPs after reboot (whereabouts reconciliation)")
+		for i := int32(0); i < replicas; i++ {
+			podName := fmt.Sprintf("%s-%d", statefulSetName, i)
+			originalIP := podIPs[podName]
+
+			pod, err := clientset.CoreV1().Pods(testNS).Get(ctx, podName, metav1.GetOptions{})
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			// Parse network status annotation
+			netStatus := pod.Annotations["k8s.v1.cni.cncf.io/network-status"]
+			o.Expect(netStatus).NotTo(o.BeEmpty(), "Pod %s has no network-status annotation after reboot", podName)
+
+			var networks []map[string]interface{}
+			err = json.Unmarshal([]byte(netStatus), &networks)
+			o.Expect(err).NotTo(o.HaveOccurred())
+
+			// Find the whereabouts network IP
+			// Network name in status can be "nadName" or "namespace/nadName"
+			var newIP string
+			for _, network := range networks {
+				if name, ok := network["name"].(string); ok {
+					if name == nadName || name == fmt.Sprintf("%s/%s", testNS, nadName) {
+						if ips, ok := network["ips"].([]interface{}); ok && len(ips) > 0 {
+							newIP = ips[0].(string)
+							break
+						}
+					}
+				}
+			}
+			o.Expect(newIP).NotTo(o.BeEmpty(), "Pod %s has no secondary IP after reboot", podName)
+			o.Expect(newIP).To(o.Equal(originalIP),
+				"Pod %s IP changed after reboot: was %s, now %s (whereabouts reconciliation failed)",
+				podName, originalIP, newIP)
+			g.By(fmt.Sprintf("✓ Pod %s kept the same IP: %s", podName, newIP))
+		}
+
+		g.By("Restoring original whereabouts configuration")
+		restoreCmd := []string{
+			"/bin/bash", "-c",
+			"mv /host/etc/kubernetes/cni/net.d/whereabouts.d/whereabouts.conf.backup /host/etc/kubernetes/cni/net.d/whereabouts.d/whereabouts.conf 2>/dev/null || true",
+		}
+		// Best effort restore - may fail if debug pod was killed during reboot
+		_, _ = execInPod(ctx, clientset, config, testNS, debugPodName, "debug", restoreCmd)
+	})
 })
 
 // createNAD creates a NetworkAttachmentDefinition
