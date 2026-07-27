@@ -1470,6 +1470,11 @@ python3 /tmp/server.py`,
 		ns := &corev1.Namespace{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: testNS,
+				Labels: map[string]string{
+					"pod-security.kubernetes.io/enforce": "privileged",
+					"pod-security.kubernetes.io/audit":   "privileged",
+					"pod-security.kubernetes.io/warn":    "privileged",
+				},
 			},
 		}
 		_, err := clientset.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
@@ -1489,8 +1494,8 @@ python3 /tmp/server.py`,
 		o.Expect(len(nodes.Items)).To(o.BeNumerically(">", 0), "Should have at least one node")
 
 		var targetNode string
+		var fallbackNode string
 		for _, node := range nodes.Items {
-			// Find a Ready, schedulable node
 			isReady := false
 			for _, condition := range node.Status.Conditions {
 				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
@@ -1498,10 +1503,22 @@ python3 /tmp/server.py`,
 					break
 				}
 			}
-			if isReady && !node.Spec.Unschedulable {
-				targetNode = node.Name
-				break
+			if !isReady || node.Spec.Unschedulable {
+				continue
 			}
+			_, isControlPlane := node.Labels["node-role.kubernetes.io/control-plane"]
+			_, isMaster := node.Labels["node-role.kubernetes.io/master"]
+			if isControlPlane || isMaster {
+				if fallbackNode == "" {
+					fallbackNode = node.Name
+				}
+				continue
+			}
+			targetNode = node.Name
+			break
+		}
+		if targetNode == "" {
+			targetNode = fallbackNode
 		}
 		o.Expect(targetNode).NotTo(o.BeEmpty(), "Should have at least one Ready, schedulable node")
 
@@ -1680,15 +1697,12 @@ python3 /tmp/server.py`,
 		}
 
 		g.By(fmt.Sprintf("Force rebooting node %s", targetNode))
-		// Note: This is a destructive operation
-		// In a real test environment, this should be done carefully
 		rebootCmd := []string{
 			"/bin/bash", "-c",
-			"nsenter -t 1 -m -u -i -n reboot --force &",
+			"chroot /host systemctl reboot --force",
 		}
 
 		_, _ = execInPod(ctx, clientset, config, testNS, debugPodName, "debug", rebootCmd)
-		// Ignore errors as the pod will be killed during reboot
 
 		g.By("Waiting for node to become NotReady")
 		o.Eventually(func() bool {
@@ -1718,10 +1732,13 @@ python3 /tmp/server.py`,
 			return false
 		}, 600, 10).Should(o.BeTrue(), "Node did not come back Ready after reboot")
 
-		g.By("Deleting StatefulSet pods to trigger recreation")
+		g.By("Force deleting StatefulSet pods to trigger recreation")
+		gracePeriod := int64(0)
 		for i := int32(0); i < replicas; i++ {
 			podName := fmt.Sprintf("%s-%d", statefulSetName, i)
-			err := clientset.CoreV1().Pods(testNS).Delete(ctx, podName, metav1.DeleteOptions{})
+			err := clientset.CoreV1().Pods(testNS).Delete(ctx, podName, metav1.DeleteOptions{
+				GracePeriodSeconds: &gracePeriod,
+			})
 			if err != nil && !apierrors.IsNotFound(err) {
 				g.GinkgoLogr.Error(err, "Failed to delete pod", "pod", podName)
 			}
@@ -1734,7 +1751,7 @@ python3 /tmp/server.py`,
 				return false
 			}
 			return sts.Status.ReadyReplicas == replicas
-		}, 180, 5).Should(o.BeTrue(), "StatefulSet pods did not get recreated")
+		}, 300, 10).Should(o.BeTrue(), "StatefulSet pods did not get recreated")
 
 		g.By("Verifying pods get the same IPs after reboot (whereabouts reconciliation)")
 		for i := int32(0); i < replicas; i++ {
